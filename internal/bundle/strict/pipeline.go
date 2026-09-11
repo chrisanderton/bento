@@ -25,7 +25,8 @@ type feedbackPipeline struct {
 
 	retryTransactionCh chan message.Transaction
 
-	shutSig *shutdown.Signaller
+	shutSig       *shutdown.Signaller
+	lifecycleOnce sync.Once
 
 	logger log.Modular
 
@@ -59,8 +60,9 @@ func newFeedbackProcessor(pipe processor.Pipeline, mgr bundle.NewManagement) pro
 
 // newMergeChannels merged a bento stream's input-channel with a retry-channel
 // to allow for requeuing failed transactions.
-func (p *feedbackPipeline) newMergeChannels(ctx context.Context) <-chan message.Transaction {
+func (p *feedbackPipeline) newMergeChannels(ctx context.Context) (<-chan message.Transaction, <-chan struct{}) {
 	out := make(chan message.Transaction)
+	done := make(chan struct{})
 	var wg sync.WaitGroup
 
 	shutSig := shutdown.NewSignaller()
@@ -73,12 +75,26 @@ func (p *feedbackPipeline) newMergeChannels(ctx context.Context) <-chan message.
 			wg.Done()
 		}()
 
-		for tran := range p.transactionsIn {
+		for {
+			var tran message.Transaction
+			var open bool
+			select {
+			case tran, open = <-p.transactionsIn:
+				if !open {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
 			if p.isRetrying.Load() {
 				_ = tran.Ack(ctx, errors.New("retry"))
 				continue
 			}
-			out <- tran
+			select {
+			case out <- tran:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -108,7 +124,11 @@ func (p *feedbackPipeline) newMergeChannels(ctx context.Context) <-chan message.
 
 				select {
 				case <-time.After(backoffDuration):
-					out <- tran
+					select {
+					case out <- tran:
+					case <-ctx.Done():
+						return
+					}
 				case <-shutSig.SoftStopChan():
 					return
 				}
@@ -126,9 +146,10 @@ func (p *feedbackPipeline) newMergeChannels(ctx context.Context) <-chan message.
 	go func() {
 		wg.Wait()
 		close(out)
+		close(done)
 	}()
 
-	return out
+	return out, done
 }
 
 // loop continually ingests messages from a merged channel that combines
@@ -147,14 +168,15 @@ func (p *feedbackPipeline) loop() {
 
 	defer func() {
 		p.pipe.TriggerCloseNow()
-		if err := p.pipe.WaitForClose(closeNowCtx); err != nil {
-			p.logger.Error("Error waiting for pipe close: %v", err)
-		}
 		closeChOnce()
 		p.shutSig.TriggerHasStopped()
 	}()
 
-	mergedCh := p.newMergeChannels(closeNowCtx)
+	mergedCh, mergeDone := p.newMergeChannels(closeNowCtx)
+	defer func() {
+		cnDone()
+		<-mergeDone
+	}()
 	for {
 		var tran message.Transaction
 		var open bool
@@ -203,13 +225,13 @@ func (p *feedbackPipeline) loop() {
 }
 
 func (p *feedbackPipeline) Consume(msgs <-chan message.Transaction) error {
-	if p.transactionsIn != nil {
-		return component.ErrAlreadyStarted
-	}
-	p.transactionsIn = msgs
-
-	go p.loop()
-	return p.pipe.Consume(p.transactionsOut)
+	err := error(component.ErrAlreadyStarted)
+	p.lifecycleOnce.Do(func() {
+		p.transactionsIn = msgs
+		err = p.pipe.Consume(p.transactionsOut)
+		go p.loop()
+	})
+	return err
 }
 
 func (p *feedbackPipeline) TransactionChan() <-chan message.Transaction {
@@ -217,15 +239,21 @@ func (p *feedbackPipeline) TransactionChan() <-chan message.Transaction {
 }
 
 func (p *feedbackPipeline) TriggerCloseNow() {
-	p.pipe.TriggerCloseNow()
 	p.shutSig.TriggerHardStop()
+	p.lifecycleOnce.Do(func() {
+		// No forwarding workers exist when shutdown wins before Consume.
+		close(p.transactionsOut)
+		p.shutSig.TriggerHasStopped()
+	})
+	p.pipe.TriggerCloseNow()
 }
 
 func (p *feedbackPipeline) WaitForClose(ctx context.Context) error {
+	err := p.pipe.WaitForClose(ctx)
 	select {
 	case <-p.shutSig.HasStoppedChan():
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Join(err, ctx.Err())
 	}
-	return nil
+	return err
 }
