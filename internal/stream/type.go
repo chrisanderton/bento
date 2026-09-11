@@ -44,6 +44,9 @@ func New(conf Config, mgr bundle.NewManagement, opts ...func(*Type)) (*Type, err
 		opt(t)
 	}
 	if err := t.start(); err != nil {
+		if closeErr := t.closeFailedStart(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
 		return nil, err
 	}
 
@@ -101,22 +104,26 @@ func (t *Type) start() (err error) {
 	// Constructors
 	iMgr := t.manager.IntoPath("input")
 	if t.inputLayer, err = iMgr.NewInput(t.conf.Input); err != nil {
+		t.inputLayer = nil
 		return
 	}
 	if t.conf.Buffer.Type != "none" {
 		bMgr := t.manager.IntoPath("buffer")
 		if t.bufferLayer, err = bMgr.NewBuffer(t.conf.Buffer); err != nil {
+			t.bufferLayer = nil
 			return
 		}
 	}
 	if tLen := len(t.conf.Pipeline.Processors); tLen > 0 {
 		pMgr := t.manager.IntoPath("pipeline")
 		if t.pipelineLayer, err = pMgr.NewPipeline(t.conf.Pipeline); err != nil {
+			t.pipelineLayer = nil
 			return
 		}
 	}
 	oMgr := t.manager.IntoPath("output")
 	if t.outputLayer, err = oMgr.NewOutput(t.conf.Output); err != nil {
+		t.outputLayer = nil
 		return
 	}
 
@@ -151,6 +158,40 @@ func (t *Type) start() (err error) {
 	}(t.outputLayer)
 
 	return nil
+}
+
+// closeFailedStart releases only successfully constructed layers. Signal all
+// layers before joining any: the graph might not be connected, so graceful
+// propagation cannot be relied upon. New has no caller context; it retains
+// ownership until cleanup finishes rather than returning with orphaned work.
+func (t *Type) closeFailedStart() error {
+	type layer interface {
+		TriggerCloseNow()
+		WaitForClose(context.Context) error
+	}
+	var layers []layer
+	if t.inputLayer != nil {
+		layers = append(layers, t.inputLayer)
+	}
+	if t.bufferLayer != nil {
+		layers = append(layers, t.bufferLayer)
+	}
+	if t.pipelineLayer != nil {
+		layers = append(layers, t.pipelineLayer)
+	}
+	if t.outputLayer != nil {
+		layers = append(layers, t.outputLayer)
+	}
+	for _, c := range layers {
+		c.TriggerCloseNow()
+	}
+	var errs []error
+	for _, c := range layers {
+		if err := c.WaitForClose(context.Background()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // StopGracefully attempts to close the stream in the most graceful way by only
