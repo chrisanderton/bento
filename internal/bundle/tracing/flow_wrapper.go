@@ -2,6 +2,7 @@ package tracing
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Jeffail/shutdown"
 
@@ -34,7 +35,10 @@ func (f *flowIDInput) UnwrapInput() input.Streamed {
 }
 
 func (f *flowIDInput) loop() {
-	defer close(f.tChan)
+	defer func() {
+		close(f.tChan)
+		f.shutSig.TriggerHasStopped()
+	}()
 	readChan := f.wrapped.TransactionChan()
 	for {
 		var tran message.Transaction
@@ -81,5 +85,10 @@ func (f *flowIDInput) TriggerCloseNow() {
 func (f *flowIDInput) WaitForClose(ctx context.Context) error {
 	err := f.wrapped.WaitForClose(ctx)
 	f.shutSig.TriggerHardStop()
+	select {
+	case <-f.shutSig.HasStoppedChan():
+	case <-ctx.Done():
+		return errors.Join(err, ctx.Err())
+	}
 	return err
 }
