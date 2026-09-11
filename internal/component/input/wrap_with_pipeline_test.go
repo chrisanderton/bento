@@ -21,6 +21,9 @@ import (
 type mockInput struct {
 	closeOnce sync.Once
 	ts        chan message.Transaction
+	waitErr   error
+	waitCalls int
+	waitGate  <-chan struct{}
 }
 
 func (m *mockInput) TransactionChan() <-chan message.Transaction {
@@ -43,14 +46,24 @@ func (m *mockInput) TriggerCloseNow() {
 }
 
 func (m *mockInput) WaitForClose(ctx context.Context) error {
-	return errors.New("wasnt expecting to ever see this tbh")
+	m.waitCalls++
+	if m.waitGate != nil {
+		select {
+		case <-m.waitGate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return m.waitErr
 }
 
 //------------------------------------------------------------------------------
 
 type mockPipe struct {
-	tsIn <-chan message.Transaction
-	ts   chan message.Transaction
+	tsIn      <-chan message.Transaction
+	ts        chan message.Transaction
+	waitErr   error
+	waitCalls int
 }
 
 func (m *mockPipe) Consume(ts <-chan message.Transaction) error {
@@ -67,7 +80,70 @@ func (m *mockPipe) TriggerCloseNow() {
 }
 
 func (m *mockPipe) WaitForClose(ctx context.Context) error {
-	return nil
+	m.waitCalls++
+	return m.waitErr
+}
+
+func TestWrapPipelineWaitPreservesBothErrors(t *testing.T) {
+	inputErr := errors.New("input cleanup failed")
+	pipeErr := errors.New("processor cleanup failed")
+	for _, tc := range []struct {
+		name              string
+		inputErr, pipeErr error
+	}{
+		{name: "success"},
+		{name: "input_error", inputErr: inputErr},
+		{name: "processor_error", pipeErr: pipeErr},
+		{name: "both_errors", inputErr: inputErr, pipeErr: pipeErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := &mockInput{ts: make(chan message.Transaction), waitErr: tc.inputErr}
+			pipe := &mockPipe{ts: make(chan message.Transaction), waitErr: tc.pipeErr}
+			wrapped, err := input.WrapWithPipeline(in, func() (iprocessor.Pipeline, error) { return pipe, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				err := wrapped.WaitForClose(t.Context())
+				if (err != nil) != (tc.inputErr != nil || tc.pipeErr != nil) {
+					t.Errorf("WaitForClose(%s) = %v, want matching error presence", tc.name, err)
+				}
+				if tc.inputErr != nil && !errors.Is(err, tc.inputErr) {
+					t.Errorf("WaitForClose(%s) = %v, want input cause", tc.name, err)
+				}
+				if tc.pipeErr != nil && !errors.Is(err, tc.pipeErr) {
+					t.Errorf("WaitForClose(%s) = %v, want processor cause", tc.name, err)
+				}
+			}
+			if in.waitCalls != 2 || pipe.waitCalls != 2 {
+				t.Errorf("WaitForClose(%s) calls input=%d processor=%d, want 2 each", tc.name, in.waitCalls, pipe.waitCalls)
+			}
+		})
+	}
+}
+
+func TestWrapPipelineCancelledWaitCanBeJoinedAgain(t *testing.T) {
+	release := make(chan struct{})
+	in := &mockInput{ts: make(chan message.Transaction), waitGate: release}
+	pipeErr := errors.New("processor cleanup failed")
+	pipe := &mockPipe{ts: make(chan message.Transaction), waitErr: pipeErr}
+	wrapped, err := input.WrapWithPipeline(in, func() (iprocessor.Pipeline, error) { return pipe, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped.TriggerCloseNow()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := wrapped.WaitForClose(ctx); !errors.Is(err, context.Canceled) || !errors.Is(err, pipeErr) {
+		t.Errorf("WaitForClose(cancelled, blocked input) = %v, want cancellation and processor error", err)
+	}
+	close(release)
+	if err := wrapped.WaitForClose(t.Context()); !errors.Is(err, pipeErr) || errors.Is(err, context.Canceled) {
+		t.Errorf("WaitForClose(fresh, released input) = %v, want processor error without prior cancellation", err)
+	}
+	if in.waitCalls != 2 || pipe.waitCalls != 2 {
+		t.Errorf("WaitForClose(cancelled then fresh) calls input=%d processor=%d, want 2 each", in.waitCalls, pipe.waitCalls)
+	}
 }
 
 //------------------------------------------------------------------------------

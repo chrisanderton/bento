@@ -2,6 +2,7 @@ package io
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Jeffail/shutdown"
 
@@ -31,7 +32,8 @@ type dynamicFanInInput struct {
 	inputs           map[string]input.Streamed
 	inputClosedChans map[string]chan struct{}
 
-	shutSig *shutdown.Signaller
+	shutSig  *shutdown.Signaller
+	closeErr error // Published before the stopped signal.
 }
 
 func newDynamicFanInInput(
@@ -113,12 +115,21 @@ func (d *dynamicFanInInput) addInput(ident string, in input.Streamed) error {
 		}()
 		d.onAdd(context.Background(), ident)
 		for {
-			in, open := <-in.TransactionChan()
-			if !open {
-				// Race condition: This will be called when shutting down.
+			var tran message.Transaction
+			var open bool
+			select {
+			case tran, open = <-in.TransactionChan():
+				if !open {
+					return
+				}
+			case <-d.shutSig.HardStopChan():
 				return
 			}
-			d.transactionChan <- in
+			select {
+			case d.transactionChan <- tran:
+			case <-d.shutSig.HardStopChan():
+				return
+			}
 		}
 	}(in, closedChan)
 
@@ -129,11 +140,13 @@ func (d *dynamicFanInInput) addInput(ident string, in input.Streamed) error {
 	return nil
 }
 
-func (d *dynamicFanInInput) removeInput(ctx context.Context, ident string) error {
+// removeInput reports removal separately from errors produced by finished cleanup.
+// An interrupted wait retains ownership so a replacement cannot overlap it.
+func (d *dynamicFanInInput) removeInput(ctx context.Context, ident string) (removed bool, err error) {
 	input, exists := d.inputs[ident]
 	if !exists {
 		// Nothing to do
-		return nil
+		return true, nil
 	}
 
 	input.TriggerStopConsuming()
@@ -142,13 +155,19 @@ func (d *dynamicFanInInput) removeInput(ctx context.Context, ident string) error
 	case <-ctx.Done():
 		// Do NOT remove inputs from our map unless we are sure they are
 		// closed.
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 
+	err = input.WaitForClose(ctx)
+	if err != nil && ctx.Err() != nil {
+		// A cancelled caller cannot establish that cleanup finished. Retain the
+		// input for a fresh wait even if completion raced with cancellation.
+		return false, err
+	}
 	delete(d.inputs, ident)
 	delete(d.inputClosedChans, ident)
 
-	return nil
+	return true, err
 }
 
 // managerLoop is an internal loop that monitors new and dead input types.
@@ -160,11 +179,18 @@ func (d *dynamicFanInInput) managerLoop() {
 
 		closeNowCtx, done := d.shutSig.HardStopCtx(context.Background())
 		for key := range d.inputs {
-			_ = d.removeInput(closeNowCtx, key)
+			if removed, err := d.removeInput(closeNowCtx, key); removed {
+				d.closeErr = errors.Join(d.closeErr, err)
+			}
 		}
 
 		for _, i := range d.inputs {
 			i.TriggerCloseNow()
+		}
+		// A cancelled graceful wait did not release child or worker ownership.
+		for key, i := range d.inputs {
+			d.closeErr = errors.Join(d.closeErr, i.WaitForClose(context.Background()))
+			<-d.inputClosedChans[key]
 		}
 
 		done()
@@ -180,8 +206,12 @@ func (d *dynamicFanInInput) managerLoop() {
 			}
 			var err error
 			if _, exists := d.inputs[wrappedInput.Name]; exists {
-				if err = d.removeInput(wrappedInput.ctx, wrappedInput.Name); err != nil {
-					d.log.Error("Failed to stop old copy of dynamic input '%v': %v\n", wrappedInput.Name, err)
+				removed, closeErr := d.removeInput(wrappedInput.ctx, wrappedInput.Name)
+				if closeErr != nil {
+					d.log.Error("Failed to stop old copy of dynamic input '%v': %v\n", wrappedInput.Name, closeErr)
+				}
+				if !removed {
+					err = closeErr
 				}
 			}
 			if err == nil && wrappedInput.Input != nil {
@@ -216,5 +246,5 @@ func (d *dynamicFanInInput) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return d.closeErr
 }
