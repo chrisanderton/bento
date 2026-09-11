@@ -23,6 +23,7 @@ type Stream struct {
 	strm    *stream.Type
 	httpAPI *api.Type
 	strmMut sync.Mutex
+	hasRun  bool
 	shutSig *shutdown.Signaller
 	onStart func()
 
@@ -56,19 +57,28 @@ func newStream(
 
 // Run attempts to start the stream pipeline and blocks until either the stream
 // has gracefully come to a stop, or the provided context is cancelled.
+// A Stream can be run only once, including when pipeline construction fails.
+// On construction failure, Run closes built resources and returns the startup
+// error together with any cleanup error. Stop can retry incomplete cleanup.
 func (s *Stream) Run(ctx context.Context) (err error) {
 	s.strmMut.Lock()
-	if s.strm != nil {
-		err = errors.New("stream has already been run")
-	} else {
-		s.strm, err = stream.New(s.conf, s.mgr,
-			stream.OptOnClose(func() {
-				s.shutSig.TriggerHasStopped()
-			}))
+	if s.hasRun {
+		s.strmMut.Unlock()
+		return errors.New("stream has already been run")
 	}
+	s.hasRun = true
+	s.strm, err = stream.New(s.conf, s.mgr,
+		stream.OptOnClose(func() {
+			s.shutSig.TriggerHasStopped()
+		}))
 	s.strmMut.Unlock()
 	if err != nil {
-		return
+		// Build creates shared resources before Run constructs the pipeline.
+		// A constructor error must not strand those resources behind a nil strm.
+		if stopErr := s.Stop(ctx); stopErr != nil {
+			return errors.Join(err, stopErr)
+		}
+		return err
 	}
 
 	if s.httpAPI != nil {
@@ -108,8 +118,9 @@ func (s *Stream) StopWithin(timeout time.Duration) error {
 func (s *Stream) Stop(ctx context.Context) (err error) {
 	s.strmMut.Lock()
 	strm := s.strm
+	hasRun := s.hasRun
 	s.strmMut.Unlock()
-	if strm == nil {
+	if !hasRun {
 		return errors.New("stream has not been run yet")
 	}
 
@@ -159,8 +170,10 @@ func (s *Stream) Stop(ctx context.Context) (err error) {
 		_ = closeHTTP(context.Background())
 	}()
 
-	if err = strm.Stop(ctx); err != nil {
-		return
+	if strm != nil {
+		if err = strm.Stop(ctx); err != nil {
+			return
+		}
 	}
 
 	s.mgr.TriggerStopConsuming()
