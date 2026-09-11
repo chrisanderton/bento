@@ -97,7 +97,11 @@ func (n *notBatchedOutput) loop() {
 	defer func() {
 		close(n.outChan)
 		n.out.TriggerCloseNow()
-		_ = n.out.WaitForClose(ctx)
+		// Hard stop cancels message work, not ownership of the child. Using
+		// its cancelled context here would permanently report completion
+		// before the child closes. Each caller of our WaitForClose still
+		// bounds its own wait without discarding this completion signal.
+		_ = n.out.WaitForClose(context.Background())
 		n.shutSig.TriggerHasStopped()
 	}()
 
