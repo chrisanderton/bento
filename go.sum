@@ -1808,8 +1808,8 @@ github.com/smira/go-statsd v1.3.4 h1:kBYWcLSGT+qC6JVbvfz48kX7mQys32fjDOPrfmsSx2c
 github.com/smira/go-statsd v1.3.4/go.mod h1:RjdsESPgDODtg1VpVVf9MJrEW2Hw0wtRNbmB1CAhu6A=
 github.com/snowflakedb/gosnowflake/v2 v2.2.0 h1:zm0fhoAknhZ+DZ9crMGbIrTxFZhS2yVlPbJ6EqjyWdE=
 github.com/snowflakedb/gosnowflake/v2 v2.2.0/go.mod h1:poUMAfesYFh8piXMqKVPW304tekACzv1cfskxMdpikY=
-github.com/snowplow/snowplow-golang-analytics-sdk v0.4.0 h1:NsHqJlv1gOAwUSkyj/vA/yrGvV9PGAutUAjfShaQ3DA=
-github.com/snowplow/snowplow-golang-analytics-sdk v0.4.0/go.mod h1:NupNFhNOUp42uUo+eQ5chfz/iprPia1LBq3ESBy9jiU=
+github.com/snowplow/snowplow-golang-analytics-sdk v0.4.1 h1:cdIa9zAf6lGGvNYt3P/EZe6fV+Q/ACgSmv3xXANSpF4=
+github.com/snowplow/snowplow-golang-analytics-sdk v0.4.1/go.mod h1:NupNFhNOUp42uUo+eQ5chfz/iprPia1LBq3ESBy9jiU=
 github.com/sourcegraph/conc v0.3.0 h1:OQTbbt6P72L20UqAkXXuLOj79LfEanQ+YQFNpLA9ySo=
 github.com/sourcegraph/conc v0.3.0/go.mod h1:Sdozi7LEKbFPqYX2/J+iBAM6HpqSLTASQIKqDmF7Mt0=
 github.com/spaolacci/murmur3 v0.0.0-20180118202830-f09979ecbc72/go.mod h1:JwIasOWyU6f++ZhiEuf87xNszmSA2myDM2Kzu9HwQUA=
