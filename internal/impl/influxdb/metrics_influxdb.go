@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	client "github.com/influxdata/influxdb1-client/v2"
@@ -121,8 +122,10 @@ type influxDBMetrics struct {
 	pingInterval time.Duration
 	timeout      time.Duration
 
-	ctx    context.Context
-	cancel func()
+	ctx       context.Context
+	cancel    func()
+	loopWG    sync.WaitGroup
+	closeOnce sync.Once
 
 	registry        metrics.Registry
 	runtimeRegistry metrics.Registry
@@ -187,7 +190,7 @@ func fromParsed(conf *service.ParsedConfig, logger *service.Logger) (i *influxDB
 	i.batchConfig.RetentionPolicy, _ = conf.FieldString(imFieldRetentionPolicy)
 	i.batchConfig.WriteConsistency, _ = conf.FieldString(imFieldWriteConsistency)
 
-	go i.loop()
+	i.loopWG.Go(i.loop)
 
 	return i, nil
 }
@@ -387,9 +390,15 @@ func (i *influxDBMetrics) HandlerFunc() http.HandlerFunc {
 }
 
 func (i *influxDBMetrics) Close(context.Context) error {
-	if err := i.publishRegistry(); err != nil {
-		i.log.Errorf("failed to send metrics data: %s", err)
-	}
-	i.client.Close()
+	// Stop polling before the final flush and client close. Stream cleanup can
+	// call Close more than once, including concurrently after startup failure.
+	i.closeOnce.Do(func() {
+		i.cancel()
+		i.loopWG.Wait()
+		if err := i.publishRegistry(); err != nil {
+			i.log.Errorf("failed to send metrics data: %s", err)
+		}
+		i.client.Close()
+	})
 	return nil
 }
