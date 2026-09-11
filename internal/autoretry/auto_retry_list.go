@@ -136,7 +136,11 @@ func (l *List[T]) Shift(ctx context.Context, enableRead bool) (t T, fn AckFunc, 
 	defer done()
 	go func() {
 		<-ctx.Done()
+		// Synchronize with the cancellation check and Wait so the wake-up
+		// cannot be lost while Shift is returning from retry backoff.
+		l.cond.L.Lock()
 		l.cond.Broadcast()
+		l.cond.L.Unlock()
 	}()
 
 	if enableRead && l.readInFlight == 0 && l.pendingRead == nil {
