@@ -2,6 +2,7 @@ package tracing
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 
 	"github.com/Jeffail/shutdown"
@@ -36,7 +37,10 @@ func (t *tracedInput) UnwrapInput() input.Streamed {
 }
 
 func (t *tracedInput) loop() {
-	defer close(t.tChan)
+	defer func() {
+		close(t.tChan)
+		t.shutSig.TriggerHasStopped()
+	}()
 	readChan := t.wrapped.TransactionChan()
 	for {
 		var tran message.Transaction
@@ -85,5 +89,10 @@ func (t *tracedInput) TriggerCloseNow() {
 func (t *tracedInput) WaitForClose(ctx context.Context) error {
 	err := t.wrapped.WaitForClose(ctx)
 	t.shutSig.TriggerHardStop()
+	select {
+	case <-t.shutSig.HasStoppedChan():
+	case <-ctx.Done():
+		return errors.Join(err, ctx.Err())
+	}
 	return err
 }
