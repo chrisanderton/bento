@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/warpstreamlabs/bento/internal/impl/aws/config"
 	"github.com/warpstreamlabs/bento/public/service"
@@ -291,8 +290,10 @@ type cwMetrics struct {
 	datumses  map[string]*cloudWatchDatum
 	datumLock *sync.Mutex
 
-	ctx    context.Context
-	cancel func()
+	ctx       context.Context
+	cancel    func()
+	closeOnce sync.Once
+	closeErr  error
 
 	config cwmConfig
 	log    *service.Logger
@@ -513,9 +514,12 @@ func (c *cwMetrics) HandlerFunc() http.HandlerFunc {
 	return nil
 }
 
-func (c *cwMetrics) Close(ctx context.Context) error {
-	defer c.cancel()
-	eg, _ := errgroup.WithContext(ctx)
-	eg.Go(c.flush)
-	return eg.Wait()
+func (c *cwMetrics) Close(context.Context) error {
+	// A second Close must join the final flush, not cancel its shared context
+	// while the first Close is still sending. Keep the result for every caller.
+	c.closeOnce.Do(func() {
+		defer c.cancel()
+		c.closeErr = c.flush()
+	})
+	return c.closeErr
 }
