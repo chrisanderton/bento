@@ -338,7 +338,8 @@ type sequenceInput struct {
 
 	transactions chan message.Transaction
 
-	shutSig *shutdown.Signaller
+	shutSig  *shutdown.Signaller
+	closeErr error // Published before the stopped signal.
 }
 
 type sequenceTarget struct {
@@ -521,6 +522,8 @@ func (r *sequenceInput) loop() {
 			t.TriggerStopConsuming()
 			_ = t.WaitForClose(shutNowCtx)
 			t.TriggerCloseNow()
+			// Hard stop cancels shutNowCtx; resource cleanup still needs a join.
+			r.closeErr = t.WaitForClose(context.Background())
 		}
 		close(r.transactions)
 		r.shutSig.TriggerHasStopped()
@@ -620,5 +623,5 @@ func (r *sequenceInput) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return r.closeErr
 }

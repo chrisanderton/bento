@@ -2,6 +2,7 @@ package input
 
 import (
 	"context"
+	"errors"
 
 	"github.com/warpstreamlabs/bento/internal/component"
 	iprocessor "github.com/warpstreamlabs/bento/internal/component/processor"
@@ -77,5 +78,7 @@ func (i *WithPipeline) TriggerCloseNow() {
 // WaitForClose is a blocking call to wait until the component has finished
 // shutting down and cleaning up resources.
 func (i *WithPipeline) WaitForClose(ctx context.Context) error {
-	return i.pipe.WaitForClose(ctx)
+	// Hard stop can finish the processors before the input has released its
+	// resources. Join both owners, even when one reports a cleanup error.
+	return errors.Join(i.in.WaitForClose(ctx), i.pipe.WaitForClose(ctx))
 }
