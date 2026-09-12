@@ -1,6 +1,8 @@
 package processors
 
 import (
+	"context"
+	"errors"
 	"strconv"
 
 	"github.com/warpstreamlabs/bento/internal/bundle"
@@ -21,7 +23,9 @@ func AppendFromConfig(conf output.Config, mgr bundle.NewManagement, pipelines ..
 				pMgr := mgr.IntoPath("processors", strconv.Itoa(j))
 				processors[j], err = pMgr.NewProcessor(procConf)
 				if err != nil {
-					return nil, err
+					partial := pipeline.NewProcessor(processors[:j]...)
+					partial.TriggerCloseNow()
+					return nil, errors.Join(err, partial.WaitForClose(context.Background()))
 				}
 			}
 			return pipeline.NewProcessor(processors...), nil

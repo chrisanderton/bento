@@ -22,11 +22,14 @@ type WithPipeline struct {
 func WrapWithPipeline(in Streamed, pipeConstructor iprocessor.PipelineConstructorFunc) (*WithPipeline, error) {
 	pipe, err := pipeConstructor()
 	if err != nil {
-		return nil, err
+		in.TriggerCloseNow()
+		return nil, errors.Join(err, in.WaitForClose(context.Background()))
 	}
 
 	if err := pipe.Consume(in.TransactionChan()); err != nil {
-		return nil, err
+		in.TriggerCloseNow()
+		pipe.TriggerCloseNow()
+		return nil, errors.Join(err, in.WaitForClose(context.Background()), pipe.WaitForClose(context.Background()))
 	}
 	return &WithPipeline{
 		in:   in,

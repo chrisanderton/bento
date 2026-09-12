@@ -1,6 +1,8 @@
 package processors
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -22,7 +24,9 @@ func AppendFromConfig(conf input.Config, mgr bundle.NewManagement, pipelines ...
 				var err error
 				processors[j], err = newMgr.NewProcessor(procConf)
 				if err != nil {
-					return nil, fmt.Errorf("failed to create processor '%v': %v", procConf.Type, err)
+					partial := pipeline.NewProcessor(processors[:j]...)
+					partial.TriggerCloseNow()
+					return nil, errors.Join(fmt.Errorf("failed to create processor '%v': %w", procConf.Type, err), partial.WaitForClose(context.Background()))
 				}
 			}
 			return pipeline.NewProcessor(processors...), nil
