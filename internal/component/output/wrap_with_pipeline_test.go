@@ -87,7 +87,11 @@ func TestBasicWrapPipeline(t *testing.T) {
 		ts: make(chan message.Transaction),
 	}
 
-	_, err := output.WrapWithPipeline(mockOut, func() (processor.Pipeline, error) {
+	// Construction failure now closes the supplied output. Use a separate
+	// fixture whose pre-start cleanup can complete instead of reusing it.
+	closed := make(chan message.Transaction)
+	close(closed)
+	_, err := output.WrapWithPipeline(&mockOutput{ts: closed}, func() (processor.Pipeline, error) {
 		return nil, errors.New("nope")
 	})
 	if err == nil {

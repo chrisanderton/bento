@@ -2,6 +2,7 @@ package output
 
 import (
 	"context"
+	"errors"
 	"slices"
 
 	"github.com/warpstreamlabs/bento/internal/component"
@@ -22,11 +23,14 @@ type WithPipeline struct {
 func WrapWithPipeline(out Streamed, pipeConstructor iprocessor.PipelineConstructorFunc) (*WithPipeline, error) {
 	pipe, err := pipeConstructor()
 	if err != nil {
-		return nil, err
+		out.TriggerCloseNow()
+		return nil, errors.Join(err, out.WaitForClose(context.Background()))
 	}
 
 	if err := out.Consume(pipe.TransactionChan()); err != nil {
-		return nil, err
+		out.TriggerCloseNow()
+		pipe.TriggerCloseNow()
+		return nil, errors.Join(err, out.WaitForClose(context.Background()), pipe.WaitForClose(context.Background()))
 	}
 	return &WithPipeline{
 		out:  out,
