@@ -2,6 +2,7 @@ package input
 
 import (
 	"context"
+	"errors"
 
 	"github.com/warpstreamlabs/bento/internal/component"
 	iprocessor "github.com/warpstreamlabs/bento/internal/component/processor"
@@ -21,11 +22,14 @@ type WithPipeline struct {
 func WrapWithPipeline(in Streamed, pipeConstructor iprocessor.PipelineConstructorFunc) (*WithPipeline, error) {
 	pipe, err := pipeConstructor()
 	if err != nil {
-		return nil, err
+		in.TriggerCloseNow()
+		return nil, errors.Join(err, in.WaitForClose(context.Background()))
 	}
 
 	if err := pipe.Consume(in.TransactionChan()); err != nil {
-		return nil, err
+		in.TriggerCloseNow()
+		pipe.TriggerCloseNow()
+		return nil, errors.Join(err, in.WaitForClose(context.Background()), pipe.WaitForClose(context.Background()))
 	}
 	return &WithPipeline{
 		in:   in,
@@ -77,5 +81,7 @@ func (i *WithPipeline) TriggerCloseNow() {
 // WaitForClose is a blocking call to wait until the component has finished
 // shutting down and cleaning up resources.
 func (i *WithPipeline) WaitForClose(ctx context.Context) error {
-	return i.pipe.WaitForClose(ctx)
+	// Hard stop can finish the processors before the input has released its
+	// resources. Join both owners, even when one reports a cleanup error.
+	return errors.Join(i.in.WaitForClose(ctx), i.pipe.WaitForClose(ctx))
 }

@@ -128,10 +128,15 @@ func (i *fanInInputBroker) TriggerCloseNow() {
 }
 
 func (i *fanInInputBroker) WaitForClose(ctx context.Context) error {
+	var err error
+	// Forwarding completion does not prove that the inputs released resources.
+	for _, child := range i.closables {
+		err = errors.Join(err, child.WaitForClose(ctx))
+	}
 	select {
 	case <-i.shutSig.HasStoppedChan():
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Join(err, ctx.Err())
 	}
-	return nil
+	return err
 }

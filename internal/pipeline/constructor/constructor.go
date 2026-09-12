@@ -1,6 +1,8 @@
 package constructor
 
 import (
+	"context"
+	"errors"
 	"strconv"
 
 	"github.com/warpstreamlabs/bento/internal/bundle"
@@ -16,7 +18,10 @@ func New(conf pipeline.Config, mgr bundle.NewManagement) (processor.Pipeline, er
 		pMgr := mgr.IntoPath("processors", strconv.Itoa(j))
 		processors[j], err = pMgr.NewProcessor(procConf)
 		if err != nil {
-			return nil, err
+			// Reuse pre-start cleanup without executing any messages.
+			partial := pipeline.NewProcessor(processors[:j]...)
+			partial.TriggerCloseNow()
+			return nil, errors.Join(err, partial.WaitForClose(context.Background()))
 		}
 	}
 	if conf.Threads == 1 {

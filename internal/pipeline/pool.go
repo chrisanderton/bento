@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,11 @@ type Pool struct {
 	messagesIn  <-chan message.Transaction
 	messagesOut chan message.Transaction
 
-	shutSig *shutdown.Signaller
+	shutSig       *shutdown.Signaller
+	lifecycleOnce sync.Once
+	started       bool // Read after lifecycleOnce.Do has published the winning path.
+	msgProcessors []processor.V1
+	closeErr      error // Published before the stopped signal.
 }
 
 // NewPool creates a new processing pool.
@@ -35,10 +40,11 @@ func NewPool(threads int, log log.Modular, msgProcessors ...processor.V1) (*Pool
 	}
 
 	p := &Pool{
-		workers:     make([]processor.Pipeline, threads),
-		log:         log,
-		messagesOut: make(chan message.Transaction),
-		shutSig:     shutdown.NewSignaller(),
+		msgProcessors: msgProcessors,
+		workers:       make([]processor.Pipeline, threads),
+		log:           log,
+		messagesOut:   make(chan message.Transaction),
+		shutSig:       shutdown.NewSignaller(),
 	}
 
 	for i := range p.workers {
@@ -52,19 +58,15 @@ func NewPool(threads int, log log.Modular, msgProcessors ...processor.V1) (*Pool
 
 // loop is the processing loop of this pipeline.
 func (p *Pool) loop() {
-	// Note this is currently kept open as we only have our children as a
-	// shutdown mechanism. This puts trust in individual processor pipelines, if
-	// that's not realistic we can consider adding a close now to the
-	// TriggerCloseNow method.
-	closeNowCtx, cnDone := p.shutSig.HardStopCtx(context.Background())
-	defer cnDone()
-
 	defer func() {
+		// A hard stop cancels processing, not the join of worker-owned cleanup.
+		var errs []error
 		for _, c := range p.workers {
-			if err := c.WaitForClose(closeNowCtx); err != nil {
-				break
+			if err := c.WaitForClose(context.Background()); err != nil {
+				errs = append(errs, err)
 			}
 		}
+		p.closeErr = errors.Join(errs...)
 
 		close(p.messagesOut)
 		p.shutSig.TriggerHasStopped()
@@ -130,11 +132,16 @@ func (p *Pool) loop() {
 
 // Consume assigns a messages channel for the pipeline to read.
 func (p *Pool) Consume(msgs <-chan message.Transaction) error {
-	if p.messagesIn != nil {
+	started := false
+	p.lifecycleOnce.Do(func() {
+		started = true
+		p.started = true
+		p.messagesIn = msgs
+		go p.loop()
+	})
+	if !started {
 		return component.ErrAlreadyStarted
 	}
-	p.messagesIn = msgs
-	go p.loop()
 	return nil
 }
 
@@ -147,6 +154,19 @@ func (p *Pool) TransactionChan() <-chan message.Transaction {
 // TriggerCloseNow signals that the component should close immediately,
 // messages in flight will be dropped.
 func (p *Pool) TriggerCloseNow() {
+	p.lifecycleOnce.Do(func() {
+		p.shutSig.TriggerHardStop()
+		go func() {
+			// Workers share these processors. Before startup there are no worker
+			// loops to join, so close the shared resources once, not per worker.
+			p.closeErr = closeProcessors(p.msgProcessors)
+			close(p.messagesOut)
+			p.shutSig.TriggerHasStopped()
+		}()
+	})
+	if !p.started {
+		return
+	}
 	for _, w := range p.workers {
 		w.TriggerCloseNow()
 	}
@@ -163,5 +183,5 @@ func (p *Pool) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return p.closeErr
 }

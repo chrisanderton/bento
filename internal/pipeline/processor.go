@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/Jeffail/shutdown"
@@ -23,7 +24,9 @@ type Processor struct {
 
 	messagesIn <-chan message.Transaction
 
-	shutSig *shutdown.Signaller
+	shutSig       *shutdown.Signaller
+	lifecycleOnce sync.Once
+	closeErr      error // Published before the stopped signal.
 }
 
 // NewProcessor returns a new message processing pipeline.
@@ -44,12 +47,7 @@ func (p *Processor) loop() {
 	defer cnDone()
 
 	defer func() {
-		// Signal all children to close.
-		for _, c := range p.msgProcessors {
-			if err := c.Close(closeNowCtx); err != nil {
-				break
-			}
-		}
+		p.closeErr = closeProcessors(p.msgProcessors)
 
 		close(p.messagesOut)
 		p.shutSig.TriggerHasStopped()
@@ -145,11 +143,15 @@ func (p *Processor) loop() {
 
 // Consume assigns a messages channel for the pipeline to read.
 func (p *Processor) Consume(msgs <-chan message.Transaction) error {
-	if p.messagesIn != nil {
+	started := false
+	p.lifecycleOnce.Do(func() {
+		started = true
+		p.messagesIn = msgs
+		go p.loop()
+	})
+	if !started {
 		return component.ErrAlreadyStarted
 	}
-	p.messagesIn = msgs
-	go p.loop()
 	return nil
 }
 
@@ -162,6 +164,26 @@ func (p *Processor) TransactionChan() <-chan message.Transaction {
 // TriggerCloseNow signals that the processor pipeline should close immediately.
 func (p *Processor) TriggerCloseNow() {
 	p.shutSig.TriggerHardStop()
+	p.lifecycleOnce.Do(func() {
+		go func() {
+			p.closeErr = closeProcessors(p.msgProcessors)
+			close(p.messagesOut)
+			p.shutSig.TriggerHasStopped()
+		}()
+	})
+}
+
+// closeProcessors joins resource cleanup independently of processing cancellation.
+// Callers can bound WaitForClose without abandoning cleanup. A completed error
+// must not prevent the remaining processors from closing.
+func closeProcessors(processors []processor.V1) error {
+	var errs []error
+	for _, c := range processors {
+		if err := c.Close(context.Background()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // WaitForClose blocks until the component has closed down or the context is
@@ -173,5 +195,5 @@ func (p *Processor) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return p.closeErr
 }

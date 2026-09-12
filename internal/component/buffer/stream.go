@@ -65,7 +65,9 @@ type Stream struct {
 	messagesIn  <-chan message.Transaction
 	messagesOut chan message.Transaction
 
-	closedWG sync.WaitGroup
+	closedWG         sync.WaitGroup
+	lifecycleOnce    sync.Once
+	prestartCloseErr error // Published before the stopped signal, read only after it.
 }
 
 // NewStream creates a new Producer/Consumer around a buffer.
@@ -216,18 +218,21 @@ func (m *Stream) outputLoop() {
 
 // Consume assigns a messages channel for the output to read.
 func (m *Stream) Consume(msgs <-chan message.Transaction) error {
-	if m.messagesIn != nil {
+	started := false
+	m.lifecycleOnce.Do(func() {
+		started = true
+		m.messagesIn = msgs
+		m.closedWG.Add(2)
+		go m.inputLoop()
+		go m.outputLoop()
+		go func() {
+			m.closedWG.Wait()
+			m.shutSig.TriggerHasStopped()
+		}()
+	})
+	if !started {
 		return component.ErrAlreadyStarted
 	}
-	m.messagesIn = msgs
-
-	m.closedWG.Add(2)
-	go m.inputLoop()
-	go m.outputLoop()
-	go func() {
-		m.closedWG.Wait()
-		m.shutSig.TriggerHasStopped()
-	}()
 	return nil
 }
 
@@ -241,11 +246,25 @@ func (m *Stream) TransactionChan() <-chan message.Transaction {
 // close once the buffer is empty.
 func (m *Stream) TriggerStopConsuming() {
 	m.shutSig.TriggerSoftStop()
+	m.closeBeforeConsume()
 }
 
 // TriggerCloseNow shuts down the Stream and stops processing messages.
 func (m *Stream) TriggerCloseNow() {
 	m.shutSig.TriggerHardStop()
+	m.closeBeforeConsume()
+}
+
+// closeBeforeConsume owns cleanup only if no consuming loop was started. Do not
+// start the buffer to close it: persisted messages must not be read on failure.
+func (m *Stream) closeBeforeConsume() {
+	m.lifecycleOnce.Do(func() {
+		go func() {
+			m.prestartCloseErr = m.buffer.Close(context.Background())
+			close(m.messagesOut)
+			m.shutSig.TriggerHasStopped()
+		}()
+	})
 }
 
 // WaitForClose blocks until the Stream output has closed down.
@@ -255,5 +274,5 @@ func (m *Stream) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return m.prestartCloseErr
 }
