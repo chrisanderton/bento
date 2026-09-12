@@ -24,9 +24,9 @@ type Processor struct {
 
 	messagesIn <-chan message.Transaction
 
-	shutSig          *shutdown.Signaller
-	lifecycleOnce    sync.Once
-	prestartCloseErr error // Published before the stopped signal.
+	shutSig       *shutdown.Signaller
+	lifecycleOnce sync.Once
+	closeErr      error // Published before the stopped signal.
 }
 
 // NewProcessor returns a new message processing pipeline.
@@ -47,12 +47,7 @@ func (p *Processor) loop() {
 	defer cnDone()
 
 	defer func() {
-		// Signal all children to close.
-		for _, c := range p.msgProcessors {
-			if err := c.Close(closeNowCtx); err != nil {
-				break
-			}
-		}
+		p.closeErr = closeProcessors(p.msgProcessors)
 
 		close(p.messagesOut)
 		p.shutSig.TriggerHasStopped()
@@ -171,16 +166,17 @@ func (p *Processor) TriggerCloseNow() {
 	p.shutSig.TriggerHardStop()
 	p.lifecycleOnce.Do(func() {
 		go func() {
-			p.prestartCloseErr = closeUnstartedProcessors(p.msgProcessors)
+			p.closeErr = closeProcessors(p.msgProcessors)
 			close(p.messagesOut)
 			p.shutSig.TriggerHasStopped()
 		}()
 	})
 }
 
-// closeUnstartedProcessors releases constructed processors without executing a
-// message. A failure must not prevent the remaining processors from closing.
-func closeUnstartedProcessors(processors []processor.V1) error {
+// closeProcessors joins resource cleanup independently of processing cancellation.
+// Callers can bound WaitForClose without abandoning cleanup. A completed error
+// must not prevent the remaining processors from closing.
+func closeProcessors(processors []processor.V1) error {
 	var errs []error
 	for _, c := range processors {
 		if err := c.Close(context.Background()); err != nil {
@@ -199,5 +195,5 @@ func (p *Processor) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return p.prestartCloseErr
+	return p.closeErr
 }
