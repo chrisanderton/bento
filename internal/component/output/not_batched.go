@@ -18,7 +18,9 @@ type notBatchedOutput struct {
 	inChan  <-chan message.Transaction
 	outChan chan message.Transaction
 
-	shutSig *shutdown.Signaller
+	shutSig          *shutdown.Signaller
+	lifecycleOnce    sync.Once
+	prestartCloseErr error // Published before the stopped signal.
 }
 
 // OnlySinglePayloads expands message batches into individual payloads,
@@ -139,15 +141,16 @@ func (n *notBatchedOutput) loop() {
 //------------------------------------------------------------------------------
 
 func (n *notBatchedOutput) Consume(ts <-chan message.Transaction) error {
-	if n.inChan != nil {
-		return component.ErrAlreadyStarted
-	}
-	if err := n.out.Consume(n.outChan); err != nil {
-		return err
-	}
-	n.inChan = ts
-	go n.loop()
-	return nil
+	err := component.ErrAlreadyStarted
+	n.lifecycleOnce.Do(func() {
+		if err = n.out.Consume(n.outChan); err != nil {
+			go n.closeUnstarted()
+			return
+		}
+		n.inChan = ts
+		go n.loop()
+	})
+	return err
 }
 
 func (n *notBatchedOutput) ConnectionStatus() component.ConnectionStatuses {
@@ -156,6 +159,18 @@ func (n *notBatchedOutput) ConnectionStatus() component.ConnectionStatuses {
 
 func (n *notBatchedOutput) TriggerCloseNow() {
 	n.shutSig.TriggerHardStop()
+	n.lifecycleOnce.Do(func() {
+		go n.closeUnstarted()
+	})
+}
+
+// closeUnstarted releases the child when construction or startup fails before
+// loop takes ownership. Do not start a forwarding loop just to release resources.
+func (n *notBatchedOutput) closeUnstarted() {
+	close(n.outChan)
+	n.out.TriggerCloseNow()
+	n.prestartCloseErr = n.out.WaitForClose(context.Background())
+	n.shutSig.TriggerHasStopped()
 }
 
 // WaitForClose blocks until the File output has closed down.
@@ -165,5 +180,5 @@ func (n *notBatchedOutput) WaitForClose(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+	return n.prestartCloseErr
 }
